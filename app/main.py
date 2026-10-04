@@ -9,6 +9,7 @@ LEAF_TABLE_HEADER_SIZE = 8
 # sqlite_schema columns, in record order.
 SCHEMA_TYPE = 0
 SCHEMA_TBL_NAME = 2
+SCHEMA_ROOTPAGE = 3
 
 TEXT_ENCODINGS = {
     1: "utf-8",
@@ -88,6 +89,12 @@ def text_encoding(database: bytes) -> str:
     return TEXT_ENCODINGS.get(encoding_code, "utf-8")
 
 
+def page_size(database: bytes) -> int:
+    """Database page size. A stored value of 1 means 65536."""
+    size = int.from_bytes(database[16:18], byteorder="big")
+    return 65536 if size == 1 else size
+
+
 def schema_cell_offsets(database: bytes) -> list[int]:
     """Offsets of every cell on the sqlite_schema page, relative to the page start."""
     cell_count = int.from_bytes(
@@ -107,6 +114,24 @@ def read_leaf_cell(database: bytes, cell_offset: int, encoding: str) -> list:
     _, cursor = read_varint(database, cell_offset)
     _, cursor = read_varint(database, cursor)
     return read_record(database, cursor, encoding)
+
+
+def table_rootpage(database: bytes, table_name: str) -> int:
+    """Root page number of a user table, from its sqlite_schema row."""
+    encoding = text_encoding(database)
+    for cell_offset in schema_cell_offsets(database):
+        row = read_leaf_cell(database, cell_offset, encoding)
+        if row[SCHEMA_TYPE] == "table" and row[SCHEMA_TBL_NAME] == table_name:
+            return row[SCHEMA_ROOTPAGE]
+    raise ValueError(f"no such table: {table_name}")
+
+
+def page_cell_count(database: bytes, page_number: int) -> int:
+    """Number of cells on a b-tree page. On a leaf table page, that is the row count."""
+    page_offset = (page_number - 1) * page_size(database)
+    # Page 1 begins with the 100-byte database header; later pages do not.
+    header_offset = page_offset + (SCHEMA_PAGE_HEADER_OFFSET if page_number == 1 else 0)
+    return int.from_bytes(database[header_offset + 3 : header_offset + 5], byteorder="big")
 
 
 def user_table_names(database: bytes) -> list[str]:
@@ -132,18 +157,25 @@ def main() -> None:
     if command == ".dbinfo":
         # Stage 1: database page size is a 2-byte big-endian value
         # immediately after the 16-byte magic string.
-        page_size = int.from_bytes(database[16:18], byteorder="big")
-
         # Stage 2: sqlite_schema lives on page 1. The 100-byte file header
         # is part of that page, and the b-tree page header follows it.
         # Cell count is a 2-byte big-endian integer at page-header offset 3.
         # Each cell is one schema row, and this stage only has tables.
-        number_of_tables = int.from_bytes(database[103:105], byteorder="big")
-
-        print(f"database page size: {page_size}")
-        print(f"number of tables: {number_of_tables}")
+        print(f"database page size: {page_size(database)}")
+        print(f"number of tables: {page_cell_count(database, 1)}")
     elif command == ".tables":
+        # Stage 3: user table names live in sqlite_schema.tbl_name.
+        # The cell pointer array follows the page header; each entry is a
+        # 2-byte big-endian offset to a table b-tree leaf cell. A cell is a
+        # payload-size varint, a rowid varint, and a record. The record's
+        # third column is tbl_name. Skip sqlite_* tables, same as SQLite.
         print(" ".join(user_table_names(database)))
+    elif command.upper().startswith("SELECT COUNT(*)"):
+        # Stage 4: the last token is the table name. Its sqlite_schema row
+        # stores the root page, and that page's cell count is the row count
+        # while the table still fits on a single leaf page.
+        table_name = command.split(" ")[-1]
+        print(page_cell_count(database, table_rootpage(database, table_name)))
     else:
         print(f"Invalid command: {command}")
 
