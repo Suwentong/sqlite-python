@@ -1,5 +1,6 @@
 import struct
 import sys
+from collections.abc import Iterator
 
 import sqlparse
 from sqlparse.sql import Comparison, Identifier, IdentifierList, Where
@@ -8,7 +9,9 @@ from sqlparse.sql import Comparison, Identifier, IdentifierList, Where
 # the start of that page, and the 8-byte leaf table b-tree header follows it.
 SCHEMA_PAGE_HEADER_OFFSET = 100
 LEAF_TABLE_HEADER_SIZE = 8
+INTERIOR_TABLE_HEADER_SIZE = 12
 LEAF_TABLE_PAGE_TYPE = 0x0D
+INTERIOR_TABLE_PAGE_TYPE = 0x05
 
 # sqlite_schema columns, in record order.
 SCHEMA_TYPE = 0
@@ -284,29 +287,107 @@ def table_columns(create_sql: str) -> list[tuple[str, bool]]:
     return columns
 
 
-def leaf_table_rows(database: bytes, page_number: int) -> list[tuple[int, list]]:
-    """(rowid, record) for every cell on a leaf table page."""
-    page_size_bytes = page_size(database)
-    page_start = (page_number - 1) * page_size_bytes
-    # Page 1 begins with the 100-byte database header; later pages do not.
-    header = page_start + (SCHEMA_PAGE_HEADER_OFFSET if page_number == 1 else 0)
-    if database[header] != LEAF_TABLE_PAGE_TYPE:
-        raise ValueError(f"page {page_number} is not a leaf table page")
+def usable_page_size(database: bytes) -> int:
+    """Page size minus the reserved bytes at the end of every page."""
+    return page_size(database) - database[20]
 
-    cell_count = int.from_bytes(database[header + 3 : header + 5], byteorder="big")
-    array_start = header + LEAF_TABLE_HEADER_SIZE
+
+def table_leaf_local_size(payload_size: int, usable: int) -> int:
+    """Bytes of a table-leaf payload stored on the b-tree page itself.
+
+    Anything past this spills onto a chain of overflow pages. U is the usable
+    page size; the thresholds below are the ones SQLite uses for leaf table cells.
+    """
+    max_local = usable - 35
+    if payload_size <= max_local:
+        return payload_size
+    min_local = ((usable - 12) * 32 // 255) - 23
+    local = min_local + ((payload_size - min_local) % (usable - 4))
+    if local <= max_local:
+        return local
+    return min_local
+
+
+def read_overflow(
+    database: bytes,
+    page_number: int,
+    remaining: int,
+    page_size_bytes: int,
+    usable: int,
+) -> bytes:
+    """Payload bytes stored on the overflow-page chain starting at page_number."""
+    chunks = []
+    while remaining > 0 and page_number != 0:
+        page_start = (page_number - 1) * page_size_bytes
+        page_number = int.from_bytes(database[page_start : page_start + 4], byteorder="big")
+        take = min(remaining, usable - 4)
+        chunks.append(database[page_start + 4 : page_start + 4 + take])
+        remaining -= take
+    return b"".join(chunks)
+
+
+def table_rows(database: bytes, page_number: int) -> Iterator[tuple[int, list]]:
+    """(rowid, record) for every row in a table b-tree, in rowid order.
+
+    An interior page stores no rows. Each of its cells names a left child, and
+    a final right-child pointer covers the rest of the keys. A leaf page holds
+    the rows. A payload that does not fit on the leaf continues on overflow pages.
+    """
+    page_size_bytes = page_size(database)
     encoding = text_encoding(database)
-    rows = []
-    for index in range(cell_count):
-        pointer = array_start + index * 2
-        # Cell pointers are offsets from the start of the page.
-        cell_offset = page_start + int.from_bytes(
-            database[pointer : pointer + 2], byteorder="big"
-        )
-        _, cursor = read_varint(database, cell_offset)
-        rowid, cursor = read_varint(database, cursor)
-        rows.append((rowid, read_record(database, cursor, encoding)))
-    return rows
+    usable = usable_page_size(database)
+
+    def walk(number: int) -> Iterator[tuple[int, list]]:
+        page_start = (number - 1) * page_size_bytes
+        # Page 1 begins with the 100-byte database header; later pages do not.
+        header = page_start + (SCHEMA_PAGE_HEADER_OFFSET if number == 1 else 0)
+        page_type = database[header]
+        cell_count = int.from_bytes(database[header + 3 : header + 5], byteorder="big")
+
+        if page_type == INTERIOR_TABLE_PAGE_TYPE:
+            array_start = header + INTERIOR_TABLE_HEADER_SIZE
+            for index in range(cell_count):
+                pointer = array_start + index * 2
+                cell_offset = page_start + int.from_bytes(
+                    database[pointer : pointer + 2], byteorder="big"
+                )
+                child = int.from_bytes(database[cell_offset : cell_offset + 4], byteorder="big")
+                yield from walk(child)
+            right_child = int.from_bytes(database[header + 8 : header + 12], byteorder="big")
+            yield from walk(right_child)
+            return
+
+        if page_type != LEAF_TABLE_PAGE_TYPE:
+            raise ValueError(f"page {number} is not a table b-tree page")
+
+        array_start = header + LEAF_TABLE_HEADER_SIZE
+        for index in range(cell_count):
+            pointer = array_start + index * 2
+            # Cell pointers are offsets from the start of the page.
+            cell_offset = page_start + int.from_bytes(
+                database[pointer : pointer + 2], byteorder="big"
+            )
+            payload_size, cursor = read_varint(database, cell_offset)
+            rowid, cursor = read_varint(database, cursor)
+            local = table_leaf_local_size(payload_size, usable)
+            if local == payload_size:
+                record = read_record(database, cursor, encoding)
+            else:
+                payload = database[cursor : cursor + local]
+                overflow_page = int.from_bytes(
+                    database[cursor + local : cursor + local + 4], byteorder="big"
+                )
+                payload += read_overflow(
+                    database,
+                    overflow_page,
+                    payload_size - local,
+                    page_size_bytes,
+                    usable,
+                )
+                record = read_record(payload, 0, encoding)
+            yield rowid, record
+
+    yield from walk(page_number)
 
 
 def render_value(value) -> str:
@@ -343,8 +424,8 @@ def select_columns(
 ) -> list[str]:
     """One line per row. Multiple columns are joined with '|', in SELECT order.
 
-    `where` is (column, literal) from `column = literal`. The table still fits
-    on its root page, so the filter is a scan of that page.
+    `where` is (column, literal) from `column = literal`. Rows may span many
+    pages, so the filter is a scan of the whole table b-tree.
     """
     rootpage, create_sql = table_definition(database, table_name)
     columns = table_columns(create_sql)
@@ -353,7 +434,7 @@ def select_columns(
     filter_value = where[1] if where is not None else None
 
     lines = []
-    for rowid, record in leaf_table_rows(database, rootpage):
+    for rowid, record in table_rows(database, rootpage):
         if filter_spec is not None:
             # NULL never equals a literal, including another NULL.
             cell = column_value(rowid, record, *filter_spec)
@@ -482,12 +563,13 @@ def main() -> None:
         table_name = command.split(" ")[-1]
         print(page_cell_count(database, table_rootpage(database, table_name)))
     elif command.upper().startswith("SELECT"):
-        # Stages 5–7: records store columns in CREATE TABLE order. That
+        # Stages 5–8: records store columns in CREATE TABLE order. That
         # statement is the sql column of the table's sqlite_schema row. An
         # INTEGER PRIMARY KEY is the cell rowid; the record body holds NULL
         # for it. Several columns are printed on one line, separated by '|'.
-        # WHERE column = literal keeps matching rows. The table still fits
-        # on its root page, so this is a scan of that page.
+        # WHERE column = literal keeps matching rows. A large table's root
+        # is an interior page whose cells point at child pages, so the scan
+        # walks the whole b-tree down to the leaves.
         parsed = parse_select(command)
         if parsed is None:
             print(f"Invalid command: {command}")
