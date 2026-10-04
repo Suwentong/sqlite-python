@@ -2,6 +2,7 @@ import struct
 import sys
 
 import sqlparse
+from sqlparse.sql import Comparison, Identifier, IdentifierList, Where
 
 # Page 1 is the sqlite_schema table. The 100-byte database header occupies
 # the start of that page, and the 8-byte leaf table b-tree header follows it.
@@ -325,49 +326,130 @@ def column_spec(columns: list[tuple[str, bool]], column_name: str) -> tuple[int,
     raise ValueError(f"no such column: {column_name}")
 
 
-def select_columns(database: bytes, table_name: str, column_names: list[str]) -> list[str]:
-    """One line per row. Multiple columns are joined with '|', in SELECT order."""
+def column_value(rowid: int, record: list, column_index: int, is_rowid: bool):
+    """Value of one column. INTEGER PRIMARY KEY lives in the cell rowid."""
+    if is_rowid:
+        return rowid
+    if column_index < len(record):
+        return record[column_index]
+    return None
+
+
+def select_columns(
+    database: bytes,
+    table_name: str,
+    column_names: list[str],
+    where: tuple[str, object] | None = None,
+) -> list[str]:
+    """One line per row. Multiple columns are joined with '|', in SELECT order.
+
+    `where` is (column, literal) from `column = literal`. The table still fits
+    on its root page, so the filter is a scan of that page.
+    """
     rootpage, create_sql = table_definition(database, table_name)
-    specs = [column_spec(table_columns(create_sql), name) for name in column_names]
+    columns = table_columns(create_sql)
+    specs = [column_spec(columns, name) for name in column_names]
+    filter_spec = column_spec(columns, where[0]) if where is not None else None
+    filter_value = where[1] if where is not None else None
 
     lines = []
     for rowid, record in leaf_table_rows(database, rootpage):
-        values = []
-        for column_index, is_rowid in specs:
-            if is_rowid:
-                value = rowid
-            elif column_index < len(record):
-                value = record[column_index]
-            else:
-                value = None
-            values.append(render_value(value))
+        if filter_spec is not None:
+            # NULL never equals a literal, including another NULL.
+            cell = column_value(rowid, record, *filter_spec)
+            if cell is None or cell != filter_value:
+                continue
+        values = [
+            render_value(column_value(rowid, record, column_index, is_rowid))
+            for column_index, is_rowid in specs
+        ]
         lines.append("|".join(values))
     return lines
 
 
-def parse_select(command: str) -> tuple[list[str], str] | None:
-    """SELECT col [, col ...] FROM table. Returns (columns, table), or None."""
-    tokens = command.split()
-    if len(tokens) < 4 or tokens[0].upper() != "SELECT":
-        return None
-    try:
-        from_index = next(
-            index for index, token in enumerate(tokens) if token.upper() == "FROM"
-        )
-    except StopIteration:
-        return None
-    # The table name is the only token after FROM.
-    if from_index < 2 or from_index != len(tokens) - 2:
+def sql_literal(token) -> object:
+    """Python value of a SQLite literal token."""
+    if token.ttype is sqlparse.tokens.Literal.String.Single:
+        # Single quotes wrap the text. A quote inside the text is written ''.
+        return token.value[1:-1].replace("''", "'")
+    if token.ttype is sqlparse.tokens.Literal.Number.Integer:
+        return int(token.value)
+    raise ValueError(f"unsupported literal: {token.value}")
+
+
+def parse_where(where: Where) -> tuple[str, object] | None:
+    """(column, literal) from `WHERE column = literal`, or None if not that shape."""
+    comparison = next(
+        (token for token in where.tokens if isinstance(token, Comparison)), None
+    )
+    if comparison is None:
         return None
 
-    column_names = [
-        unquote_identifier(part.strip())
-        for part in " ".join(tokens[1:from_index]).split(",")
-        if part.strip()
-    ]
-    if not column_names:
+    column = None
+    operator = None
+    literal = None
+    for token in comparison.tokens:
+        if token.is_whitespace:
+            continue
+        if isinstance(token, Identifier) and column is None:
+            column = unquote_identifier(token.get_real_name())
+        elif token.ttype is sqlparse.tokens.Operator.Comparison and operator is None:
+            operator = token.value
+        elif literal is None and token.ttype in {
+            sqlparse.tokens.Literal.String.Single,
+            sqlparse.tokens.Literal.Number.Integer,
+        }:
+            literal = sql_literal(token)
+        else:
+            return None
+    if column is None or operator != "=" or literal is None:
         return None
-    return column_names, unquote_identifier(tokens[-1])
+    return column, literal
+
+
+def parse_select(
+    command: str,
+) -> tuple[list[str], str, tuple[str, object] | None] | None:
+    """SELECT col [, col ...] FROM table [WHERE col = literal].
+
+    Returns (columns, table, filter). filter is None when there is no WHERE.
+    Returns None when the statement is not that shape.
+    """
+    statement = sqlparse.parse(command)[0]
+    if statement.get_type() != "SELECT":
+        return None
+
+    column_names: list[str] = []
+    table_name = None
+    where_filter = None
+    for token in statement.tokens:
+        if token.is_whitespace or token.ttype is sqlparse.tokens.Keyword.DML:
+            continue
+        if token.ttype is sqlparse.tokens.Keyword and token.normalized == "FROM":
+            continue
+        if isinstance(token, IdentifierList):
+            column_names = [
+                unquote_identifier(identifier.get_real_name())
+                for identifier in token.get_identifiers()
+            ]
+        elif isinstance(token, Identifier):
+            name = unquote_identifier(token.get_real_name())
+            if not column_names:
+                column_names = [name]
+            elif table_name is None:
+                table_name = name
+            else:
+                return None
+        elif isinstance(token, Where):
+            where_filter = parse_where(token)
+            if where_filter is None:
+                return None
+        else:
+            return None
+
+    if not column_names or table_name is None:
+        return None
+    return column_names, table_name, where_filter
 
 
 def main() -> None:
@@ -400,16 +482,18 @@ def main() -> None:
         table_name = command.split(" ")[-1]
         print(page_cell_count(database, table_rootpage(database, table_name)))
     elif command.upper().startswith("SELECT"):
-        # Stages 5–6: records store columns in CREATE TABLE order. That
+        # Stages 5–7: records store columns in CREATE TABLE order. That
         # statement is the sql column of the table's sqlite_schema row. An
         # INTEGER PRIMARY KEY is the cell rowid; the record body holds NULL
         # for it. Several columns are printed on one line, separated by '|'.
+        # WHERE column = literal keeps matching rows. The table still fits
+        # on its root page, so this is a scan of that page.
         parsed = parse_select(command)
         if parsed is None:
             print(f"Invalid command: {command}")
         else:
-            column_names, table_name = parsed
-            for line in select_columns(database, table_name, column_names):
+            column_names, table_name, where = parsed
+            for line in select_columns(database, table_name, column_names, where):
                 print(line)
     else:
         print(f"Invalid command: {command}")
