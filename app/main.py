@@ -316,30 +316,58 @@ def render_value(value) -> str:
     return str(value)
 
 
-def select_column(database: bytes, table_name: str, column_name: str) -> list[str]:
-    """Values of one column, in the order the rows are stored on the leaf page."""
-    rootpage, create_sql = table_definition(database, table_name)
+def column_spec(columns: list[tuple[str, bool]], column_name: str) -> tuple[int, bool]:
+    """(record index, is INTEGER PRIMARY KEY) for a column name."""
     wanted = column_name.lower()
-    column_index = None
-    is_rowid = False
-    for index, (name, name_is_rowid) in enumerate(table_columns(create_sql)):
+    for index, (name, is_rowid) in enumerate(columns):
         if name.lower() == wanted:
-            column_index = index
-            is_rowid = name_is_rowid
-            break
-    if column_index is None:
-        raise ValueError(f"no such column: {column_name}")
+            return index, is_rowid
+    raise ValueError(f"no such column: {column_name}")
 
-    values = []
+
+def select_columns(database: bytes, table_name: str, column_names: list[str]) -> list[str]:
+    """One line per row. Multiple columns are joined with '|', in SELECT order."""
+    rootpage, create_sql = table_definition(database, table_name)
+    specs = [column_spec(table_columns(create_sql), name) for name in column_names]
+
+    lines = []
     for rowid, record in leaf_table_rows(database, rootpage):
-        if is_rowid:
-            value = rowid
-        elif column_index < len(record):
-            value = record[column_index]
-        else:
-            value = None
-        values.append(render_value(value))
-    return values
+        values = []
+        for column_index, is_rowid in specs:
+            if is_rowid:
+                value = rowid
+            elif column_index < len(record):
+                value = record[column_index]
+            else:
+                value = None
+            values.append(render_value(value))
+        lines.append("|".join(values))
+    return lines
+
+
+def parse_select(command: str) -> tuple[list[str], str] | None:
+    """SELECT col [, col ...] FROM table. Returns (columns, table), or None."""
+    tokens = command.split()
+    if len(tokens) < 4 or tokens[0].upper() != "SELECT":
+        return None
+    try:
+        from_index = next(
+            index for index, token in enumerate(tokens) if token.upper() == "FROM"
+        )
+    except StopIteration:
+        return None
+    # The table name is the only token after FROM.
+    if from_index < 2 or from_index != len(tokens) - 2:
+        return None
+
+    column_names = [
+        unquote_identifier(part.strip())
+        for part in " ".join(tokens[1:from_index]).split(",")
+        if part.strip()
+    ]
+    if not column_names:
+        return None
+    return column_names, unquote_identifier(tokens[-1])
 
 
 def main() -> None:
@@ -372,17 +400,17 @@ def main() -> None:
         table_name = command.split(" ")[-1]
         print(page_cell_count(database, table_rootpage(database, table_name)))
     elif command.upper().startswith("SELECT"):
-        # Stage 5: records store columns in CREATE TABLE order. That statement
-        # is the sql column of the table's sqlite_schema row. An INTEGER
-        # PRIMARY KEY is the cell rowid; the record body holds NULL for it.
-        parts = command.split()
-        if len(parts) != 4 or parts[2].upper() != "FROM":
+        # Stages 5–6: records store columns in CREATE TABLE order. That
+        # statement is the sql column of the table's sqlite_schema row. An
+        # INTEGER PRIMARY KEY is the cell rowid; the record body holds NULL
+        # for it. Several columns are printed on one line, separated by '|'.
+        parsed = parse_select(command)
+        if parsed is None:
             print(f"Invalid command: {command}")
         else:
-            column_name = unquote_identifier(parts[1])
-            table_name = unquote_identifier(parts[3])
-            for value in select_column(database, table_name, column_name):
-                print(value)
+            column_names, table_name = parsed
+            for line in select_columns(database, table_name, column_names):
+                print(line)
     else:
         print(f"Invalid command: {command}")
 
