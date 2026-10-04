@@ -1,3 +1,5 @@
+import bisect
+import mmap
 import struct
 import sys
 from collections.abc import Iterator
@@ -12,6 +14,8 @@ LEAF_TABLE_HEADER_SIZE = 8
 INTERIOR_TABLE_HEADER_SIZE = 12
 LEAF_TABLE_PAGE_TYPE = 0x0D
 INTERIOR_TABLE_PAGE_TYPE = 0x05
+LEAF_INDEX_PAGE_TYPE = 0x0A
+INTERIOR_INDEX_PAGE_TYPE = 0x02
 
 # sqlite_schema columns, in record order.
 SCHEMA_TYPE = 0
@@ -55,8 +59,12 @@ TEXT_ENCODINGS = {
 
 def read_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Read a SQLite varint. Returns (value, offset just past the varint)."""
-    value = 0
-    for index in range(8):
+    byte = data[offset]
+    if byte < 0x80:
+        return byte, offset + 1
+
+    value = byte & 0x7F
+    for index in range(1, 8):
         byte = data[offset + index]
         value = (value << 7) | (byte & 0x7F)
         if byte < 0x80:
@@ -100,21 +108,32 @@ def decode_column(serial_type: int, raw: bytes, encoding: str):
     raise ValueError(f"reserved serial type: {serial_type}")
 
 
-def read_record(data: bytes, offset: int, encoding: str) -> list:
-    """Parse a record (row) stored in SQLite record format."""
+def read_record(
+    data: bytes, offset: int, encoding: str, columns: set[int] | None = None
+) -> list:
+    """Parse a record (row) stored in SQLite record format.
+
+    `columns`, when set, names the indexes to decode. Later columns are not
+    read at all. Every other value up to the last requested one is None, and
+    its body is skipped rather than turned into a string or blob.
+    """
     header_size, cursor = read_varint(data, offset)
     header_end = offset + header_size
+    last = None if columns is None else (max(columns) if columns else -1)
 
     serial_types = []
-    while cursor < header_end:
+    while cursor < header_end and (last is None or len(serial_types) <= last):
         serial_type, cursor = read_varint(data, cursor)
         serial_types.append(serial_type)
 
     body = header_end
     values = []
-    for serial_type in serial_types:
+    for index, serial_type in enumerate(serial_types):
         size = serial_type_size(serial_type)
-        values.append(decode_column(serial_type, data[body : body + size], encoding))
+        if columns is not None and index not in columns:
+            values.append(None)
+        else:
+            values.append(decode_column(serial_type, data[body : body + size], encoding))
         body += size
     return values
 
@@ -292,13 +311,12 @@ def usable_page_size(database: bytes) -> int:
     return page_size(database) - database[20]
 
 
-def table_leaf_local_size(payload_size: int, usable: int) -> int:
-    """Bytes of a table-leaf payload stored on the b-tree page itself.
+def payload_local_size(payload_size: int, usable: int, max_local: int) -> int:
+    """Bytes of a cell payload stored on the b-tree page itself.
 
-    Anything past this spills onto a chain of overflow pages. U is the usable
-    page size; the thresholds below are the ones SQLite uses for leaf table cells.
+    Anything past this spills onto overflow pages. `max_local` is U-35 for a
+    table leaf and ((U-12)*64/255)-23 for an index page. U is the usable size.
     """
-    max_local = usable - 35
     if payload_size <= max_local:
         return payload_size
     min_local = ((usable - 12) * 32 // 255) - 23
@@ -306,6 +324,16 @@ def table_leaf_local_size(payload_size: int, usable: int) -> int:
     if local <= max_local:
         return local
     return min_local
+
+
+def table_leaf_max_local(usable: int) -> int:
+    """Largest table-leaf payload stored on the page with no overflow."""
+    return usable - 35
+
+
+def index_max_local(usable: int) -> int:
+    """Largest index payload stored on the page with no overflow."""
+    return ((usable - 12) * 64 // 255) - 23
 
 
 def read_overflow(
@@ -324,6 +352,54 @@ def read_overflow(
         chunks.append(database[page_start + 4 : page_start + 4 + take])
         remaining -= take
     return b"".join(chunks)
+
+
+def locate_payload(
+    database: bytes,
+    cursor: int,
+    payload_size: int,
+    usable: int,
+    page_size_bytes: int,
+    max_local: int,
+):
+    """Buffer and offset where a cell payload starts.
+
+    The payload is read in place when it fits on the page. When it overflows,
+    the page-local prefix and the overflow chain are joined into one buffer.
+    """
+    local = payload_local_size(payload_size, usable, max_local)
+    if local == payload_size:
+        return database, cursor
+    payload = bytearray(database[cursor : cursor + local])
+    overflow_page = int.from_bytes(
+        database[cursor + local : cursor + local + 4], byteorder="big"
+    )
+    payload += read_overflow(
+        database, overflow_page, payload_size - local, page_size_bytes, usable
+    )
+    return bytes(payload), 0
+
+
+def read_table_leaf_record(
+    database: bytes,
+    cell_offset: int,
+    encoding: str,
+    usable: int,
+    page_size_bytes: int,
+    columns: set[int] | None = None,
+) -> tuple[int, list]:
+    """(rowid, record) from a table b-tree leaf cell."""
+    payload_size, cursor = read_varint(database, cell_offset)
+    rowid, cursor = read_varint(database, cursor)
+    buffer, offset = locate_payload(
+        database,
+        cursor,
+        payload_size,
+        usable,
+        page_size_bytes,
+        table_leaf_max_local(usable),
+    )
+    return rowid, read_record(buffer, offset, encoding, columns)
 
 
 def table_rows(database: bytes, page_number: int) -> Iterator[tuple[int, list]]:
@@ -367,25 +443,9 @@ def table_rows(database: bytes, page_number: int) -> Iterator[tuple[int, list]]:
             cell_offset = page_start + int.from_bytes(
                 database[pointer : pointer + 2], byteorder="big"
             )
-            payload_size, cursor = read_varint(database, cell_offset)
-            rowid, cursor = read_varint(database, cursor)
-            local = table_leaf_local_size(payload_size, usable)
-            if local == payload_size:
-                record = read_record(database, cursor, encoding)
-            else:
-                payload = database[cursor : cursor + local]
-                overflow_page = int.from_bytes(
-                    database[cursor + local : cursor + local + 4], byteorder="big"
-                )
-                payload += read_overflow(
-                    database,
-                    overflow_page,
-                    payload_size - local,
-                    page_size_bytes,
-                    usable,
-                )
-                record = read_record(payload, 0, encoding)
-            yield rowid, record
+            yield read_table_leaf_record(
+                database, cell_offset, encoding, usable, page_size_bytes
+            )
 
     yield from walk(page_number)
 
@@ -416,6 +476,246 @@ def column_value(rowid: int, record: list, column_index: int, is_rowid: bool):
     return None
 
 
+def compare_values(left, right) -> int:
+    """SQLite record order: NULL, then numbers, then text, then blobs.
+
+    Text uses BINARY collation, which for UTF-8 matches code-point order.
+    """
+    left_class = value_class(left)
+    right_class = value_class(right)
+    if left_class != right_class:
+        return -1 if left_class < right_class else 1
+    if left is None or left == right:
+        return 0
+    return -1 if left < right else 1
+
+
+def value_class(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, int | float):
+        return 1
+    if isinstance(value, str):
+        return 2
+    if isinstance(value, bytes):
+        return 3
+    raise TypeError(f"unsupported record value: {value!r}")
+
+
+def index_columns(create_sql: str) -> list[str]:
+    """Indexed column names, in CREATE INDEX order."""
+    tokens = [
+        token.value
+        for token in sqlparse.parse(create_sql)[0].flatten()
+        if not token.is_whitespace
+    ]
+    try:
+        cursor = tokens.index("(") + 1
+    except ValueError:
+        return []
+
+    names = []
+    while cursor < len(tokens) and tokens[cursor] != ")":
+        token = tokens[cursor]
+        upper = token.upper()
+        if upper == ",":
+            cursor += 1
+            continue
+        if upper in {"ASC", "DESC"}:
+            cursor += 1
+            continue
+        if upper == "COLLATE":
+            cursor += 2
+            continue
+        names.append(unquote_identifier(token))
+        cursor += 1
+    return names
+
+
+def index_root_for_column(database: bytes, table_name: str, column_name: str) -> int | None:
+    """Root page of an index whose first column is `column_name`."""
+    encoding = text_encoding(database)
+    wanted = column_name.lower()
+    for cell_offset in schema_cell_offsets(database):
+        row = read_leaf_cell(database, cell_offset, encoding)
+        if row[SCHEMA_TYPE] != "index" or row[SCHEMA_TBL_NAME] != table_name:
+            continue
+        create_sql = row[SCHEMA_SQL]
+        if not isinstance(create_sql, str):
+            continue
+        columns = index_columns(create_sql)
+        if columns and columns[0].lower() == wanted:
+            return row[SCHEMA_ROOTPAGE]
+    return None
+
+
+def matching_index_rowids(database: bytes, rootpage: int, target) -> Iterator[int]:
+    """Rowids of index entries whose first column equals `target`.
+
+    An index record is the indexed columns followed by the table rowid.
+    Interior pages store real keys, not just separators: the left child of a
+    cell holds keys lower than that cell, and the right-most child holds keys
+    higher than the last cell. Cells on a page are already in key order, so
+    a search descends only into the child that can still hold `target`.
+    """
+    page_size_bytes = page_size(database)
+    encoding = text_encoding(database)
+    usable = usable_page_size(database)
+    max_local = index_max_local(usable)
+
+    def read_key(cell_offset: int, interior: bool) -> tuple[int | None, list]:
+        cursor = cell_offset
+        child = None
+        if interior:
+            child = int.from_bytes(database[cell_offset : cell_offset + 4], byteorder="big")
+            cursor = cell_offset + 4
+        payload_size, cursor = read_varint(database, cursor)
+        buffer, offset = locate_payload(
+            database, cursor, payload_size, usable, page_size_bytes, max_local
+        )
+        return child, read_record(buffer, offset, encoding)
+
+    def walk(number: int) -> Iterator[int]:
+        page_start = (number - 1) * page_size_bytes
+        header = page_start + (SCHEMA_PAGE_HEADER_OFFSET if number == 1 else 0)
+        page_type = database[header]
+        cell_count = int.from_bytes(database[header + 3 : header + 5], byteorder="big")
+        interior = page_type == INTERIOR_INDEX_PAGE_TYPE
+        if interior:
+            header_size = INTERIOR_TABLE_HEADER_SIZE
+            right_child = int.from_bytes(database[header + 8 : header + 12], byteorder="big")
+        elif page_type == LEAF_INDEX_PAGE_TYPE:
+            header_size = LEAF_TABLE_HEADER_SIZE
+            right_child = None
+        else:
+            raise ValueError(f"page {number} is not an index b-tree page")
+
+        array = header + header_size
+        for index in range(cell_count):
+            pointer = array + index * 2
+            cell_offset = page_start + int.from_bytes(
+                database[pointer : pointer + 2], byteorder="big"
+            )
+            child, record = read_key(cell_offset, interior)
+            compared = compare_values(record[0], target)
+            if interior:
+                if compared > 0:
+                    yield from walk(child)
+                    return
+                if compared == 0:
+                    yield from walk(child)
+                    yield record[-1]
+            elif compared == 0:
+                yield record[-1]
+            elif compared > 0:
+                return
+        if right_child is not None:
+            yield from walk(right_child)
+
+    yield from walk(rootpage)
+
+
+def table_records(
+    database: bytes,
+    rootpage: int,
+    rowids: Iterator[int],
+    columns: set[int] | None = None,
+) -> Iterator[tuple[int, list]]:
+    """Records for an ascending sequence of rowids.
+
+    An interior cell's rowid is the largest rowid in its left subtree, and the
+    row itself lives on a leaf. Divider keys are cached. Cells on a leaf are
+    ordered, so the first requested rowid is found with a binary search and
+    the following ones are the cells after it.
+    """
+    page_size_bytes = page_size(database)
+    encoding = text_encoding(database)
+    usable = usable_page_size(database)
+    interiors: dict[int, tuple[list[int], list[int], int]] = {}
+    leaves: dict[int, tuple[list[int], list[int]]] = {}
+
+    def load_leaf(page_start: int, array: int, cell_count: int) -> tuple[list[int], list[int]]:
+        rowid_list = []
+        offsets = []
+        for index in range(cell_count):
+            pointer = array + index * 2
+            cell_offset = page_start + int.from_bytes(
+                database[pointer : pointer + 2], byteorder="big"
+            )
+            _, cursor = read_varint(database, cell_offset)
+            rowid, _ = read_varint(database, cursor)
+            rowid_list.append(rowid)
+            offsets.append(cell_offset)
+        return rowid_list, offsets
+
+    def descend(target: int) -> int:
+        number = rootpage
+        while True:
+            cached = interiors.get(number)
+            if cached is None and number not in leaves:
+                page_start = (number - 1) * page_size_bytes
+                header = page_start + (SCHEMA_PAGE_HEADER_OFFSET if number == 1 else 0)
+                page_type = database[header]
+                cell_count = int.from_bytes(database[header + 3 : header + 5], byteorder="big")
+                if page_type == LEAF_TABLE_PAGE_TYPE:
+                    leaves[number] = load_leaf(
+                        page_start, header + LEAF_TABLE_HEADER_SIZE, cell_count
+                    )
+                    return number
+                if page_type != INTERIOR_TABLE_PAGE_TYPE:
+                    raise ValueError(f"page {number} is not a table b-tree page")
+                array = header + INTERIOR_TABLE_HEADER_SIZE
+                right = int.from_bytes(database[header + 8 : header + 12], byteorder="big")
+                keys = []
+                children = []
+                for index in range(cell_count):
+                    pointer = array + index * 2
+                    cell_offset = page_start + int.from_bytes(
+                        database[pointer : pointer + 2], byteorder="big"
+                    )
+                    child = int.from_bytes(
+                        database[cell_offset : cell_offset + 4], byteorder="big"
+                    )
+                    key, _ = read_varint(database, cell_offset + 4)
+                    children.append(child)
+                    keys.append(key)
+                cached = (keys, children, right)
+                interiors[number] = cached
+            if number in leaves:
+                return number
+            keys, children, right = cached
+            index = bisect.bisect_left(keys, target)
+            number = right if index == len(keys) else children[index]
+
+    pending = iter(rowids)
+    try:
+        target = next(pending)
+    except StopIteration:
+        return
+
+    previous = None
+    while True:
+        number = descend(target)
+        if number == previous:
+            raise ValueError(f"indexed rowid {target} is not in the table")
+        previous = number
+        rowid_list, offsets = leaves[number]
+        start = 0
+        while rowid_list and target <= rowid_list[-1]:
+            index = bisect.bisect_left(rowid_list, target, start)
+            if index == len(rowid_list) or rowid_list[index] != target:
+                raise ValueError(f"indexed rowid {target} is not in the table")
+            _, record = read_table_leaf_record(
+                database, offsets[index], encoding, usable, page_size_bytes, columns
+            )
+            yield target, record
+            start = index + 1
+            try:
+                target = next(pending)
+            except StopIteration:
+                return
+
+
 def select_columns(
     database: bytes,
     table_name: str,
@@ -424,14 +724,29 @@ def select_columns(
 ) -> list[str]:
     """One line per row. Multiple columns are joined with '|', in SELECT order.
 
-    `where` is (column, literal) from `column = literal`. Rows may span many
-    pages, so the filter is a scan of the whole table b-tree.
+    `where` is (column, literal) from `column = literal`. When an index starts
+    with that column, matching rowids come from the index and each row is
+    fetched by rowid. Otherwise the filter is a scan of the table b-tree.
     """
     rootpage, create_sql = table_definition(database, table_name)
     columns = table_columns(create_sql)
     specs = [column_spec(columns, name) for name in column_names]
     filter_spec = column_spec(columns, where[0]) if where is not None else None
     filter_value = where[1] if where is not None else None
+
+    if where is not None:
+        index_root = index_root_for_column(database, table_name, where[0])
+        if index_root is not None:
+            needed = {index for index, is_rowid in specs if not is_rowid}
+            lines = []
+            rowids = matching_index_rowids(database, index_root, filter_value)
+            for rowid, record in table_records(database, rootpage, rowids, needed):
+                values = [
+                    render_value(column_value(rowid, record, column_index, is_rowid))
+                    for column_index, is_rowid in specs
+                ]
+                lines.append("|".join(values))
+            return lines
 
     lines = []
     for rowid, record in table_rows(database, rootpage):
@@ -510,7 +825,11 @@ def parse_select(
             continue
         if isinstance(token, IdentifierList):
             column_names = [
-                unquote_identifier(identifier.get_real_name())
+                unquote_identifier(
+                    identifier.get_real_name()
+                    if isinstance(identifier, Identifier)
+                    else identifier.value
+                )
                 for identifier in token.get_identifiers()
             ]
         elif isinstance(token, Identifier):
@@ -537,8 +856,10 @@ def main() -> None:
     database_file_path = sys.argv[1]
     command = sys.argv[2]
 
+    # Map the file instead of reading it. The index-scan test uses a ~1GB
+    # database and only a few pages are touched for each query.
     with open(database_file_path, "rb") as database_file:
-        database = database_file.read()
+        database = mmap.mmap(database_file.fileno(), 0, access=mmap.ACCESS_READ)
 
     if command == ".dbinfo":
         # Stage 1: database page size is a 2-byte big-endian value
@@ -563,13 +884,15 @@ def main() -> None:
         table_name = command.split(" ")[-1]
         print(page_cell_count(database, table_rootpage(database, table_name)))
     elif command.upper().startswith("SELECT"):
-        # Stages 5–8: records store columns in CREATE TABLE order. That
+        # Stages 5–9: records store columns in CREATE TABLE order. That
         # statement is the sql column of the table's sqlite_schema row. An
         # INTEGER PRIMARY KEY is the cell rowid; the record body holds NULL
         # for it. Several columns are printed on one line, separated by '|'.
-        # WHERE column = literal keeps matching rows. A large table's root
-        # is an interior page whose cells point at child pages, so the scan
-        # walks the whole b-tree down to the leaves.
+        # WHERE column = literal keeps matching rows. If an index starts with
+        # that column, the search follows the index b-tree and then fetches
+        # each row by rowid. Otherwise a large table's root is an interior
+        # page whose cells point at child pages, and the scan walks the whole
+        # table b-tree down to the leaves.
         parsed = parse_select(command)
         if parsed is None:
             print(f"Invalid command: {command}")
@@ -579,6 +902,7 @@ def main() -> None:
                 print(line)
     else:
         print(f"Invalid command: {command}")
+    database.close()
 
 
 if __name__ == "__main__":
