@@ -1,15 +1,46 @@
 import struct
 import sys
 
+import sqlparse
+
 # Page 1 is the sqlite_schema table. The 100-byte database header occupies
 # the start of that page, and the 8-byte leaf table b-tree header follows it.
 SCHEMA_PAGE_HEADER_OFFSET = 100
 LEAF_TABLE_HEADER_SIZE = 8
+LEAF_TABLE_PAGE_TYPE = 0x0D
 
 # sqlite_schema columns, in record order.
 SCHEMA_TYPE = 0
 SCHEMA_TBL_NAME = 2
 SCHEMA_ROOTPAGE = 3
+SCHEMA_SQL = 4
+
+# First token of a table-level constraint, as sqlparse emits it.
+TABLE_CONSTRAINTS = {
+    "CONSTRAINT",
+    "PRIMARY",
+    "PRIMARY KEY",
+    "UNIQUE",
+    "CHECK",
+    "FOREIGN",
+    "FOREIGN KEY",
+}
+
+# Tokens that end a column type name. "PRIMARY KEY" may arrive as one token
+# or as the separate words PRIMARY and KEY.
+COLUMN_CONSTRAINTS = TABLE_CONSTRAINTS | {
+    "KEY",
+    "NOT",
+    "NOT NULL",
+    "NULL",
+    "DEFAULT",
+    "COLLATE",
+    "REFERENCES",
+    "GENERATED",
+    "AS",
+    "AUTOINCREMENT",
+    "ON",
+}
 
 TEXT_ENCODINGS = {
     1: "utf-8",
@@ -116,14 +147,19 @@ def read_leaf_cell(database: bytes, cell_offset: int, encoding: str) -> list:
     return read_record(database, cursor, encoding)
 
 
-def table_rootpage(database: bytes, table_name: str) -> int:
-    """Root page number of a user table, from its sqlite_schema row."""
+def table_definition(database: bytes, table_name: str) -> tuple[int, str]:
+    """Root page and CREATE TABLE statement for a user table."""
     encoding = text_encoding(database)
     for cell_offset in schema_cell_offsets(database):
         row = read_leaf_cell(database, cell_offset, encoding)
         if row[SCHEMA_TYPE] == "table" and row[SCHEMA_TBL_NAME] == table_name:
-            return row[SCHEMA_ROOTPAGE]
+            return row[SCHEMA_ROOTPAGE], row[SCHEMA_SQL]
     raise ValueError(f"no such table: {table_name}")
+
+
+def table_rootpage(database: bytes, table_name: str) -> int:
+    """Root page number of a user table, from its sqlite_schema row."""
+    return table_definition(database, table_name)[0]
 
 
 def page_cell_count(database: bytes, page_number: int) -> int:
@@ -145,6 +181,165 @@ def user_table_names(database: bytes) -> list[str]:
             names.append(tbl_name)
     names.sort()
     return names
+
+
+def unquote_identifier(name: str) -> str:
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in "\"'`":
+        return name[1:-1]
+    if name.startswith("[") and name.endswith("]"):
+        return name[1:-1]
+    return name
+
+
+def table_columns(create_sql: str) -> list[tuple[str, bool]]:
+    """Columns in CREATE TABLE order.
+
+    The flag is true for an INTEGER PRIMARY KEY column. SQLite stores that
+    value as the cell's rowid and writes NULL in the record body.
+    """
+    tokens = [
+        token.value
+        for token in sqlparse.parse(create_sql)[0].flatten()
+        if not token.is_whitespace
+    ]
+    try:
+        cursor = tokens.index("(") + 1
+    except ValueError as exc:
+        raise ValueError(f"CREATE TABLE has no column list: {create_sql}") from exc
+
+    # name, declared type, and whether this column itself says PRIMARY KEY.
+    parsed: list[tuple[str, str, bool]] = []
+    depth = 0
+    name: str | None = None
+    type_parts: list[str] = []
+    is_primary_key = False
+    past_type = False
+    skipping_constraint = False
+    # A single-column table PRIMARY KEY (id) is also a rowid alias when id is INTEGER.
+    collecting_pk = False
+    pk_names: list[str] = []
+    table_pk: list[str] = []
+
+    def finish() -> None:
+        nonlocal name, type_parts, is_primary_key, past_type, skipping_constraint
+        nonlocal collecting_pk
+        if name is not None:
+            parsed.append((name, " ".join(type_parts).lower(), is_primary_key))
+        name = None
+        type_parts = []
+        is_primary_key = False
+        past_type = False
+        skipping_constraint = False
+        collecting_pk = False
+
+    for token in tokens[cursor:]:
+        if token == "(":
+            depth += 1
+            continue
+        if token == ")":
+            if depth == 0:
+                finish()
+                break
+            depth -= 1
+            if collecting_pk and depth == 0 and len(pk_names) == 1:
+                table_pk = pk_names
+            continue
+        if depth:
+            if collecting_pk and depth == 1 and token.upper() not in {",", "ASC", "DESC"}:
+                pk_names.append(unquote_identifier(token))
+            continue
+        if token == ",":
+            finish()
+            continue
+
+        upper = token.upper()
+        if name is None:
+            if upper in {"PRIMARY", "PRIMARY KEY"}:
+                skipping_constraint = True
+                collecting_pk = True
+                pk_names = []
+            elif upper in TABLE_CONSTRAINTS:
+                skipping_constraint = True
+            elif not skipping_constraint:
+                name = unquote_identifier(token)
+            continue
+        if upper in COLUMN_CONSTRAINTS:
+            past_type = True
+            if upper in {"PRIMARY", "PRIMARY KEY"}:
+                is_primary_key = True
+            continue
+        if not past_type:
+            type_parts.append(token)
+    else:
+        finish()
+
+    table_pk_name = table_pk[0].lower() if len(table_pk) == 1 else None
+    columns: list[tuple[str, bool]] = []
+    for column_name, declared_type, column_is_primary_key in parsed:
+        is_rowid = declared_type == "integer" and (
+            column_is_primary_key or column_name.lower() == table_pk_name
+        )
+        columns.append((column_name, is_rowid))
+    return columns
+
+
+def leaf_table_rows(database: bytes, page_number: int) -> list[tuple[int, list]]:
+    """(rowid, record) for every cell on a leaf table page."""
+    page_size_bytes = page_size(database)
+    page_start = (page_number - 1) * page_size_bytes
+    # Page 1 begins with the 100-byte database header; later pages do not.
+    header = page_start + (SCHEMA_PAGE_HEADER_OFFSET if page_number == 1 else 0)
+    if database[header] != LEAF_TABLE_PAGE_TYPE:
+        raise ValueError(f"page {page_number} is not a leaf table page")
+
+    cell_count = int.from_bytes(database[header + 3 : header + 5], byteorder="big")
+    array_start = header + LEAF_TABLE_HEADER_SIZE
+    encoding = text_encoding(database)
+    rows = []
+    for index in range(cell_count):
+        pointer = array_start + index * 2
+        # Cell pointers are offsets from the start of the page.
+        cell_offset = page_start + int.from_bytes(
+            database[pointer : pointer + 2], byteorder="big"
+        )
+        _, cursor = read_varint(database, cell_offset)
+        rowid, cursor = read_varint(database, cursor)
+        rows.append((rowid, read_record(database, cursor, encoding)))
+    return rows
+
+
+def render_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
+def select_column(database: bytes, table_name: str, column_name: str) -> list[str]:
+    """Values of one column, in the order the rows are stored on the leaf page."""
+    rootpage, create_sql = table_definition(database, table_name)
+    wanted = column_name.lower()
+    column_index = None
+    is_rowid = False
+    for index, (name, name_is_rowid) in enumerate(table_columns(create_sql)):
+        if name.lower() == wanted:
+            column_index = index
+            is_rowid = name_is_rowid
+            break
+    if column_index is None:
+        raise ValueError(f"no such column: {column_name}")
+
+    values = []
+    for rowid, record in leaf_table_rows(database, rootpage):
+        if is_rowid:
+            value = rowid
+        elif column_index < len(record):
+            value = record[column_index]
+        else:
+            value = None
+        values.append(render_value(value))
+    return values
 
 
 def main() -> None:
@@ -176,6 +371,18 @@ def main() -> None:
         # while the table still fits on a single leaf page.
         table_name = command.split(" ")[-1]
         print(page_cell_count(database, table_rootpage(database, table_name)))
+    elif command.upper().startswith("SELECT"):
+        # Stage 5: records store columns in CREATE TABLE order. That statement
+        # is the sql column of the table's sqlite_schema row. An INTEGER
+        # PRIMARY KEY is the cell rowid; the record body holds NULL for it.
+        parts = command.split()
+        if len(parts) != 4 or parts[2].upper() != "FROM":
+            print(f"Invalid command: {command}")
+        else:
+            column_name = unquote_identifier(parts[1])
+            table_name = unquote_identifier(parts[3])
+            for value in select_column(database, table_name, column_name):
+                print(value)
     else:
         print(f"Invalid command: {command}")
 
